@@ -152,34 +152,64 @@ async function loadAds() {
 
   const ads = [];
   const seen = new Set();
+  const diag = {
+    sources: sources.map((s) => ({ id: s.id, name: s.name })),
+    properties: {},
+    totalPages: 0,
+    dropped: { status: 0, portfolio: 0, closeBy: 0, format: 0, duplicate: 0 },
+    seenStatuses: {},
+    seenFormats: {},
+    seenPortfolios: {},
+    samples: [],
+  };
 
   for (const src of sources) {
     const schema = await notion(`/data_sources/${src.id}`);
+    diag.properties[src.name] = Object.entries(schema.properties || {})
+      .map(([k, v]) => `${k} (${v.type})`).sort();
     const [portfolioMap, messagingMap] = await Promise.all([
       relationMap(schema, 'Portfolios'),
       relationMap(schema, 'Messaging Funnels'),
     ]);
 
-    for (const page of await queryAll(src.id)) {
-      if (seen.has(page.id)) continue;     // same row surfaced by two sources
+    const pages = await queryAll(src.id);
+    diag.totalPages += pages.length;
+
+    for (const page of pages) {
+      if (seen.has(page.id)) { diag.dropped.duplicate++; continue; }
       seen.add(page.id);
       const pr = page.properties || {};
 
       const status = readSelect(pr['Status']);
+      const rawPortfolio = readRelation(pr['Portfolios'], portfolioMap);
+      const format = readSelect(pr['Format']);
+      const closeByRaw = readDate(pr['Close by']);
+
+      const tally = (o, v) => { const k = v || '(blank)'; o[k] = (o[k] || 0) + 1; };
+      tally(diag.seenStatuses, status);
+      tally(diag.seenFormats, format);
+      tally(diag.seenPortfolios, rawPortfolio);
+      if (diag.samples.length < 3) {
+        diag.samples.push({
+          title: titleOf(page), status, portfolio: rawPortfolio, format,
+          closeBy: closeByRaw, funnel: readSelect(pr['Funnel']),
+          messaging: readRelation(pr['Messaging Funnels'], messagingMap),
+        });
+      }
+
       const key = status.trim().toLowerCase();
       let shipped;
       if (LIVE.has(key)) shipped = true;
       else if (PIPE.has(key)) shipped = false;
-      else continue;
+      else { diag.dropped.status++; continue; }
 
-      const portfolio = PMAP[readRelation(pr['Portfolios'], portfolioMap).trim().toUpperCase()];
-      if (!portfolio) continue;
+      const portfolio = PMAP[rawPortfolio.trim().toUpperCase()];
+      if (!portfolio) { diag.dropped.portfolio++; continue; }
 
-      const closeBy = readDate(pr['Close by']);
-      if (!closeBy) continue;
+      const closeBy = closeByRaw;
+      if (!closeBy) { diag.dropped.closeBy++; continue; }
 
-      const format = readSelect(pr['Format']);
-      if (!['Video', 'Static', 'GIF'].includes(format)) continue;
+      if (!['Video', 'Static', 'GIF'].includes(format)) { diag.dropped.format++; continue; }
 
       let funnel = readSelect(pr['Funnel']);
       if (!['ToFu', 'MoFu', 'BoFu'].includes(funnel)) funnel = 'Unspecified';
@@ -198,7 +228,8 @@ async function loadAds() {
       });
     }
   }
-  return ads;
+  diag.kept = ads.length;
+  return { ads, diag };
 }
 
 /* ── static files ── */
@@ -257,6 +288,18 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (pathname === '/api/debug') {
+    try {
+      const { diag } = await loadAds();
+      res.writeHead(200, { 'content-type': 'application/json' })
+        .end(JSON.stringify(diag, null, 2));
+    } catch (err) {
+      res.writeHead(502, { 'content-type': 'application/json' })
+        .end(JSON.stringify({ error: err.message }, null, 2));
+    }
+    return;
+  }
+
   if (pathname === '/api/data') {
     const fresh = Date.now() - cache.at < CACHE_SECONDS * 1000;
     if (fresh && cache.body) {
@@ -267,7 +310,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     try {
-      const ads = await loadAds();
+      const { ads } = await loadAds();
       const body = JSON.stringify({
         ads,
         fetchedAt: new Date().toISOString(),
