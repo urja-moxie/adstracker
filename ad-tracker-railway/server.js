@@ -163,6 +163,76 @@ async function loadAds() {
   return ads;
 }
 
+/* ── one-time OAuth exchange ──────────────────────────────────────────
+ * Only used if you had to create a Public connection. Visit the
+ * Authorization URL from Notion, approve, and Notion sends you back here
+ * with ?code=... — this swaps it for an access token and shows it once.
+ * Paste that into NOTION_TOKEN, then delete the client id/secret vars.
+ */
+function page(title, body) {
+  return `<!doctype html><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${title}</title>
+<style>body{font-family:ui-sans-serif,system-ui,sans-serif;background:#C5DCD0;color:#14181A;
+margin:0;padding:48px 20px;display:flex;justify-content:center}
+.c{background:#fff;border-radius:18px;padding:30px 32px;max-width:640px;width:100%}
+h1{font-size:21px;margin:0 0 14px;letter-spacing:-.02em}
+p{line-height:1.55;color:#3C4643}
+code{background:#F2F6F3;padding:2px 6px;border-radius:5px;font-size:13px}
+textarea{width:100%;box-sizing:border-box;font-family:ui-monospace,monospace;font-size:13px;
+padding:12px;border:1px solid #D3E0D8;border-radius:10px;background:#F8FBF9;resize:vertical}
+ol{line-height:1.8;color:#3C4643}</style>
+<div class="c">${body}</div>`;
+}
+
+async function handleOAuth(code, res) {
+  const id = process.env.NOTION_CLIENT_ID;
+  const secret = process.env.NOTION_CLIENT_SECRET;
+  const redirect = process.env.NOTION_REDIRECT_URI;
+  if (!id || !secret || !redirect) {
+    res.writeHead(500, { 'content-type': 'text/html; charset=utf-8' }).end(page('Setup needed',
+      `<h1>Missing OAuth variables</h1><p>Set <code>NOTION_CLIENT_ID</code>,
+       <code>NOTION_CLIENT_SECRET</code> and <code>NOTION_REDIRECT_URI</code> in Railway,
+       then open the Authorization URL from Notion again.</p>`));
+    return;
+  }
+  try {
+    const r = await fetch('https://api.notion.com/v1/oauth/token', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Basic ' + Buffer.from(`${id}:${secret}`).toString('base64'),
+        'Content-Type': 'application/json',
+        'Notion-Version': NOTION_VERSION,
+      },
+      body: JSON.stringify({
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: redirect,
+      }),
+    });
+    const j = await r.json();
+    if (!r.ok || !j.access_token) {
+      res.writeHead(400, { 'content-type': 'text/html; charset=utf-8' }).end(page('Exchange failed',
+        `<h1>Notion rejected the exchange</h1>
+         <p>Most often this means the code expired (they last a few minutes) or
+         <code>NOTION_REDIRECT_URI</code> does not exactly match what is registered in Notion.</p>
+         <textarea rows="6" readonly>${JSON.stringify(j, null, 2)}</textarea>`));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }).end(page('Token ready',
+      `<h1>Your access token</h1>
+       <p>Copy this, then in Railway add it as <code>NOTION_TOKEN</code>.
+       It is shown once and is not stored anywhere.</p>
+       <textarea rows="3" readonly onclick="this.select()">${j.access_token}</textarea>
+       <p>Workspace: <strong>${j.workspace_name || 'unknown'}</strong></p>
+       <ol><li>Railway &rarr; Variables &rarr; add <code>NOTION_TOKEN</code></li>
+       <li>Delete <code>NOTION_CLIENT_ID</code> and <code>NOTION_CLIENT_SECRET</code></li>
+       <li>Wait for the redeploy, then reload the dashboard</li></ol>`));
+  } catch (err) {
+    res.writeHead(502, { 'content-type': 'text/html' }).end(page('Error', `<h1>${err.message}</h1>`));
+  }
+}
+
 /* ── static files ── */
 const TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -196,7 +266,11 @@ function serveStatic(req, res) {
 
 /* ── server ── */
 const server = http.createServer(async (req, res) => {
-  const { pathname } = new URL(req.url, 'http://x');
+  const u = new URL(req.url, 'http://x');
+  const { pathname } = u;
+
+  const code = u.searchParams.get('code');
+  if (code) { await handleOAuth(code, res); return; }
 
   if (pathname === '/healthz') {
     res.writeHead(200, { 'content-type': 'text/plain' }).end('ok');
