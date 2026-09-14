@@ -1,0 +1,316 @@
+/**
+ * Ad tracker — Railway server
+ *
+ *   GET /            -> public/index.html
+ *   GET /api/data    -> { ads, fetchedAt, counts }  (live from Notion)
+ *   GET /healthz     -> ok
+ *
+ * Environment variables (set these in Railway → Variables):
+ *   NOTION_TOKEN   internal connection secret, starts with ntn_   [required]
+ *   NOTION_DB_ID   the Projects database id                        [required]
+ *   CACHE_SECONDS  how long to hold a Notion response (default 300)
+ *   PORT           injected by Railway automatically
+ */
+
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const PUBLIC = path.join(__dirname, 'public');
+const PORT = process.env.PORT || 3000;
+const CACHE_SECONDS = Number(process.env.CACHE_SECONDS || 300);
+const NOTION_VERSION = '2022-06-28';
+
+/* ── status routing — must match the dashboard's definition of live ── */
+const LIVE = new Set(['completed', 'live']);
+const PIPE = new Set([
+  'shooting', 'scripting on creator', 'reshoot', 'to be scripted',
+  'pod discussion', 'in edit', 'storyboarding', 'in approval',
+  'to be storyboarded', 'scripting', 'script in approval', 'footage review',
+  'garage copy', 'edit on creator/outsourced', 'edit to be picked',
+  'non-collab post',
+]);
+// Canned, Stand By, Referencing, Creator to be mapped and Waiting for BAs
+// are deliberately ignored.
+
+const PMAP = {
+  'WAVY': 'Wavy', 'CURLY': 'Curly', 'WURLY': 'Wurly', 'SCALP': 'Scalp',
+  'OTF': 'OTF', 'RSD': 'RSD', 'WAX STICK': 'Wax Stick', 'MASK(DDHM)': 'DDHM',
+  'HRHM': 'HRHM', 'HA': 'HA', 'DS': 'DS', 'OIL': 'Oil',
+};
+
+/* ── tiny in-memory cache ── */
+let cache = { at: 0, body: null };
+
+/* ── Notion helpers ── */
+async function notion(pathname, init = {}) {
+  const res = await fetch(`https://api.notion.com/v1${pathname}`, {
+    ...init,
+    headers: {
+      Authorization: `Bearer ${process.env.NOTION_TOKEN}`,
+      'Notion-Version': NOTION_VERSION,
+      'Content-Type': 'application/json',
+    },
+  });
+  if (!res.ok) {
+    const t = await res.text();
+    throw new Error(`Notion ${res.status} on ${pathname}: ${t.slice(0, 300)}`);
+  }
+  return res.json();
+}
+
+async function queryAll(dbId) {
+  const out = [];
+  let cursor;
+  do {
+    const body = { page_size: 100 };
+    if (cursor) body.start_cursor = cursor;
+    const j = await notion(`/databases/${dbId}/query`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+    out.push(...j.results);
+    cursor = j.has_more ? j.next_cursor : null;
+  } while (cursor);
+  return out;
+}
+
+const plain = (arr) => (arr || []).map((t) => t.plain_text).join('').trim();
+
+function titleOf(page) {
+  const props = page.properties || {};
+  for (const k of Object.keys(props)) {
+    if (props[k] && props[k].type === 'title') return plain(props[k].title);
+  }
+  return '';
+}
+
+async function relationMap(schema, propName) {
+  const prop = schema.properties[propName];
+  if (!prop || prop.type !== 'relation') return {};
+  const targetId = prop.relation && prop.relation.database_id;
+  if (!targetId) return {};
+  const map = {};
+  for (const p of await queryAll(targetId)) map[p.id] = titleOf(p);
+  return map;
+}
+
+function readSelect(p) {
+  if (!p) return '';
+  if (p.type === 'select') return p.select ? p.select.name : '';
+  if (p.type === 'status') return p.status ? p.status.name : '';
+  if (p.type === 'multi_select') return (p.multi_select[0] || {}).name || '';
+  if (p.type === 'rich_text') return plain(p.rich_text);
+  return '';
+}
+const readDate = (p) =>
+  p && p.type === 'date' && p.date ? p.date.start || null : null;
+const readRelation = (p, map) =>
+  p && p.type === 'relation' && p.relation.length
+    ? map[p.relation[0].id] || ''
+    : '';
+
+/* ── main fetch + transform ── */
+async function loadAds() {
+  if (!process.env.NOTION_TOKEN) throw new Error('NOTION_TOKEN is not set');
+  if (!process.env.NOTION_DB_ID) throw new Error('NOTION_DB_ID is not set');
+  const dbId = process.env.NOTION_DB_ID;
+
+  const schema = await notion(`/databases/${dbId}`);
+  const [portfolioMap, messagingMap] = await Promise.all([
+    relationMap(schema, 'Portfolios'),
+    relationMap(schema, 'Messaging Funnels'),
+  ]);
+  const pages = await queryAll(dbId);
+
+  const ads = [];
+  for (const page of pages) {
+    const pr = page.properties || {};
+
+    const status = readSelect(pr['Status']);
+    const key = status.trim().toLowerCase();
+    let shipped;
+    if (LIVE.has(key)) shipped = true;
+    else if (PIPE.has(key)) shipped = false;
+    else continue;
+
+    const portfolio = PMAP[readRelation(pr['Portfolios'], portfolioMap).trim().toUpperCase()];
+    if (!portfolio) continue;
+
+    const closeBy = readDate(pr['Close by']);
+    if (!closeBy) continue;
+
+    const format = readSelect(pr['Format']);
+    if (!['Video', 'Static', 'GIF'].includes(format)) continue;
+
+    let funnel = readSelect(pr['Funnel']);
+    if (!['ToFu', 'MoFu', 'BoFu'].includes(funnel)) funnel = 'Unspecified';
+
+    ads.push({
+      portfolio,
+      closeBy: closeBy.slice(0, 10),
+      month: closeBy.slice(0, 7),
+      format,
+      funnel,
+      messaging: readRelation(pr['Messaging Funnels'], messagingMap) || 'Unspecified',
+      shipped,
+      status,
+      name: titleOf(page),
+    });
+  }
+  return ads;
+}
+
+/* ── one-time OAuth exchange ──────────────────────────────────────────
+ * Only used if you had to create a Public connection. Visit the
+ * Authorization URL from Notion, approve, and Notion sends you back here
+ * with ?code=... — this swaps it for an access token and shows it once.
+ * Paste that into NOTION_TOKEN, then delete the client id/secret vars.
+ */
+function page(title, body) {
+  return `<!doctype html><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${title}</title>
+<style>body{font-family:ui-sans-serif,system-ui,sans-serif;background:#C5DCD0;color:#14181A;
+margin:0;padding:48px 20px;display:flex;justify-content:center}
+.c{background:#fff;border-radius:18px;padding:30px 32px;max-width:640px;width:100%}
+h1{font-size:21px;margin:0 0 14px;letter-spacing:-.02em}
+p{line-height:1.55;color:#3C4643}
+code{background:#F2F6F3;padding:2px 6px;border-radius:5px;font-size:13px}
+textarea{width:100%;box-sizing:border-box;font-family:ui-monospace,monospace;font-size:13px;
+padding:12px;border:1px solid #D3E0D8;border-radius:10px;background:#F8FBF9;resize:vertical}
+ol{line-height:1.8;color:#3C4643}</style>
+<div class="c">${body}</div>`;
+}
+
+async function handleOAuth(code, res) {
+  const id = process.env.NOTION_CLIENT_ID;
+  const secret = process.env.NOTION_CLIENT_SECRET;
+  const redirect = process.env.NOTION_REDIRECT_URI;
+  if (!id || !secret || !redirect) {
+    res.writeHead(500, { 'content-type': 'text/html; charset=utf-8' }).end(page('Setup needed',
+      `<h1>Missing OAuth variables</h1><p>Set <code>NOTION_CLIENT_ID</code>,
+       <code>NOTION_CLIENT_SECRET</code> and <code>NOTION_REDIRECT_URI</code> in Railway,
+       then open the Authorization URL from Notion again.</p>`));
+    return;
+  }
+  try {
+    const r = await fetch('https://api.notion.com/v1/oauth/token', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Basic ' + Buffer.from(`${id}:${secret}`).toString('base64'),
+        'Content-Type': 'application/json',
+        'Notion-Version': NOTION_VERSION,
+      },
+      body: JSON.stringify({
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: redirect,
+      }),
+    });
+    const j = await r.json();
+    if (!r.ok || !j.access_token) {
+      res.writeHead(400, { 'content-type': 'text/html; charset=utf-8' }).end(page('Exchange failed',
+        `<h1>Notion rejected the exchange</h1>
+         <p>Most often this means the code expired (they last a few minutes) or
+         <code>NOTION_REDIRECT_URI</code> does not exactly match what is registered in Notion.</p>
+         <textarea rows="6" readonly>${JSON.stringify(j, null, 2)}</textarea>`));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }).end(page('Token ready',
+      `<h1>Your access token</h1>
+       <p>Copy this, then in Railway add it as <code>NOTION_TOKEN</code>.
+       It is shown once and is not stored anywhere.</p>
+       <textarea rows="3" readonly onclick="this.select()">${j.access_token}</textarea>
+       <p>Workspace: <strong>${j.workspace_name || 'unknown'}</strong></p>
+       <ol><li>Railway &rarr; Variables &rarr; add <code>NOTION_TOKEN</code></li>
+       <li>Delete <code>NOTION_CLIENT_ID</code> and <code>NOTION_CLIENT_SECRET</code></li>
+       <li>Wait for the redeploy, then reload the dashboard</li></ol>`));
+  } catch (err) {
+    res.writeHead(502, { 'content-type': 'text/html' }).end(page('Error', `<h1>${err.message}</h1>`));
+  }
+}
+
+/* ── static files ── */
+const TYPES = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.ico': 'image/x-icon',
+};
+
+function serveStatic(req, res) {
+  let rel = decodeURIComponent(new URL(req.url, 'http://x').pathname);
+  if (rel === '/' || rel === '') rel = '/index.html';
+  const file = path.join(PUBLIC, path.normalize(rel));
+  if (!file.startsWith(PUBLIC)) {          // path traversal guard
+    res.writeHead(403).end('forbidden');
+    return;
+  }
+  fs.readFile(file, (err, buf) => {
+    if (err) {
+      res.writeHead(404, { 'content-type': 'text/plain' }).end('not found');
+      return;
+    }
+    res.writeHead(200, {
+      'content-type': TYPES[path.extname(file)] || 'application/octet-stream',
+      'cache-control': 'no-cache',
+    }).end(buf);
+  });
+}
+
+/* ── server ── */
+const server = http.createServer(async (req, res) => {
+  const u = new URL(req.url, 'http://x');
+  const { pathname } = u;
+
+  const code = u.searchParams.get('code');
+  if (code) { await handleOAuth(code, res); return; }
+
+  if (pathname === '/healthz') {
+    res.writeHead(200, { 'content-type': 'text/plain' }).end('ok');
+    return;
+  }
+
+  if (pathname === '/api/data') {
+    const fresh = Date.now() - cache.at < CACHE_SECONDS * 1000;
+    if (fresh && cache.body) {
+      res.writeHead(200, {
+        'content-type': 'application/json; charset=utf-8',
+        'x-cache': 'hit',
+      }).end(cache.body);
+      return;
+    }
+    try {
+      const ads = await loadAds();
+      const body = JSON.stringify({
+        ads,
+        fetchedAt: new Date().toISOString(),
+        counts: {
+          total: ads.length,
+          live: ads.filter((a) => a.shipped).length,
+          pipeline: ads.filter((a) => !a.shipped).length,
+        },
+      });
+      cache = { at: Date.now(), body };
+      res.writeHead(200, {
+        'content-type': 'application/json; charset=utf-8',
+        'x-cache': 'miss',
+      }).end(body);
+    } catch (err) {
+      console.error('[api/data]', err.message);
+      res.writeHead(502, { 'content-type': 'application/json' })
+        .end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  serveStatic(req, res);
+});
+
+server.listen(PORT, () => console.log(`ad-tracker listening on ${PORT}`));
