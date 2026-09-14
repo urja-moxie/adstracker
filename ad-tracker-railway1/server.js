@@ -161,16 +161,38 @@ async function loadAds() {
     seenFormats: {},
     seenPortfolios: {},
     samples: [],
+    missingProperties: [],
+    skippedSources: [],
   };
 
   for (const src of sources) {
     const schema = await notion(`/data_sources/${src.id}`);
-    diag.properties[src.name] = Object.entries(schema.properties || {})
+    const props = schema.properties || {};
+    diag.properties[src.name] = Object.entries(props)
       .map(([k, v]) => `${k} (${v.type})`).sort();
+
+    // Ignore sources that plainly are not the ad tracker (e.g. a stray
+    // "New data source" holding only a title column).
+    if (!props['Status'] || !props['Close by']) {
+      diag.skippedSources.push(src.name);
+      continue;
+    }
+
+    // Relation properties are invisible to the API unless the database they
+    // point at is ALSO shared with the connection. Missing here almost always
+    // means "share the linked database too", not "the property was renamed".
+    for (const need of ['Portfolios', 'Funnel', 'Messaging Funnels']) {
+      if (!props[need] && !diag.missingProperties.includes(need)) {
+        diag.missingProperties.push(need);
+      }
+    }
+
     const [portfolioMap, messagingMap] = await Promise.all([
       relationMap(schema, 'Portfolios'),
       relationMap(schema, 'Messaging Funnels'),
     ]);
+    const funnelMap = props['Funnel'] && props['Funnel'].type === 'relation'
+      ? await relationMap(schema, 'Funnel') : null;
 
     const pages = await queryAll(src.id);
     diag.totalPages += pages.length;
@@ -192,7 +214,8 @@ async function loadAds() {
       if (diag.samples.length < 3) {
         diag.samples.push({
           title: titleOf(page), status, portfolio: rawPortfolio, format,
-          closeBy: closeByRaw, funnel: readSelect(pr['Funnel']),
+          closeBy: closeByRaw,
+          funnel: funnelMap ? readRelation(pr['Funnel'], funnelMap) : readSelect(pr['Funnel']),
           messaging: readRelation(pr['Messaging Funnels'], messagingMap),
         });
       }
@@ -211,7 +234,7 @@ async function loadAds() {
 
       if (!['Video', 'Static', 'GIF'].includes(format)) { diag.dropped.format++; continue; }
 
-      let funnel = readSelect(pr['Funnel']);
+      let funnel = funnelMap ? readRelation(pr['Funnel'], funnelMap) : readSelect(pr['Funnel']);
       if (!['ToFu', 'MoFu', 'BoFu'].includes(funnel)) funnel = 'Unspecified';
 
       ads.push({
@@ -229,6 +252,15 @@ async function loadAds() {
     }
   }
   diag.kept = ads.length;
+
+  if (!ads.length && diag.missingProperties.length) {
+    throw new Error(
+      `The API cannot see these properties: ${diag.missingProperties.join(', ')}. ` +
+      `Relation properties stay hidden until the database they point to is also ` +
+      `shared with the connection. In Notion, open each of those linked databases ` +
+      `(or the page containing them) and add the "adstracker" connection, then reload.`,
+    );
+  }
   return { ads, diag };
 }
 
