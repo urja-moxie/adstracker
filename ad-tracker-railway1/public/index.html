@@ -355,7 +355,11 @@ function panel(p,notch){
     <div class="p-head"><h3>${esc(p)}</h3><button class="x" data-close="1">Close</button></div>
     <div class="gap">${gcell('Videos',live.v,pipe.v,t.video)}${gcell('Statics',live.s,pipe.s,t.static)}</div>
     <div class="fgrid">${cols}</div>
-    ${nof?`<div class="nil" style="padding-top:12px">${nof} ad${nof===1?'':'s'} in this portfolio has no funnel set, so it isn't in the three columns above.</div>`:''}
+    ${nof?`<div class="nil" style="padding-top:12px">${
+      nof===ads.length
+        ? `None of the ${nof} ad${nof===1?'':'s'} here has a funnel, so the three columns above are empty. If this is true across every portfolio, the Funnel property is probably not visible to the integration yet — in Notion, open the Funnel database and add the connection under \u22ef \u2192 Connections.`
+        : `${nof} ad${nof===1?'':'s'} in this portfolio ${nof===1?'has':'have'} no funnel set, so ${nof===1?'it isn\u2019t':'they aren\u2019t'} in the three columns above.`
+    }</div>`:''}
   </div>`;
 }
 
